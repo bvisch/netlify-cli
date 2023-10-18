@@ -21,6 +21,7 @@ import { INTERNAL_FUNCTIONS_FOLDER, SERVE_FUNCTIONS_FOLDER } from '../../utils/f
 import { BACKGROUND_FUNCTIONS_WARNING } from '../log.mjs'
 import { getPathInProject } from '../settings.mjs'
 
+import LazyNetlifyFunction from './lazy-function.mjs'
 import NetlifyFunction from './netlify-function.mjs'
 import runtimes from './runtimes/index.mjs'
 
@@ -29,7 +30,7 @@ const TYPES_PACKAGE = '@netlify/functions'
 const ZIP_EXTENSION = '.zip'
 
 /**
- * @typedef {"buildError" | "extracted" | "loaded" | "missing-types-package" | "reloaded" | "reloading" | "removed"} FunctionEvent
+ * @typedef {"buildError" | "extracted" | "loaded" | "missing-types-package" | "reloaded" | "reloading" | "removed" | "markedForBuild"} FunctionEvent
  */
 
 export class FunctionsRegistry {
@@ -96,6 +97,11 @@ export class FunctionsRegistry {
      * @type {boolean}
      */
     this.logLambdaCompat = Boolean(logLambdaCompat)
+
+    /**
+     * Whether to lazy load functions
+     */
+    this.lazyLoadFunctions = config?.dev?.lazy
   }
 
   checkTypesPackage() {
@@ -149,71 +155,13 @@ export class FunctionsRegistry {
    * @returns
    */
   async buildFunctionAndWatchFiles(func, firstLoad = false) {
-    if (!firstLoad) {
-      FunctionsRegistry.logEvent('reloading', { func })
-    }
+    FunctionsRegistry.onPrebuild({ func, firstLoad })
 
     const { error: buildError, includedFiles, srcFilesDiff } = await func.build({ cache: this.buildCache })
 
-    if (buildError) {
-      FunctionsRegistry.logEvent('buildError', { func })
-    } else {
-      const event = firstLoad ? 'loaded' : 'reloaded'
-      const recommendedExtension = func.getRecommendedExtension()
-
-      if (recommendedExtension) {
-        const { filename } = func
-        const newFilename = filename ? `${basename(filename, extname(filename))}${recommendedExtension}` : null
-        const action = newFilename
-          ? `rename the function file to ${chalk.underline(
-              newFilename,
-            )}. Refer to https://ntl.fyi/functions-runtime for more information`
-          : `refer to https://ntl.fyi/functions-runtime`
-        const warning = `The function is using the legacy CommonJS format. To start using ES modules, ${action}.`
-
-        FunctionsRegistry.logEvent(event, { func, warnings: [warning] })
-      } else {
-        FunctionsRegistry.logEvent(event, { func })
-      }
-    }
-
-    if (func.isTypeScript()) {
-      this.checkTypesPackage()
-    }
-
-    // If the build hasn't resulted in any files being added or removed, there
-    // is nothing else we need to do.
-    if (!srcFilesDiff) {
-      return
-    }
-
-    const watcher = this.functionWatchers.get(func.name)
-
-    // If there is already a watcher for this function, we need to unwatch any
-    // files that have been removed and watch any files that have been added.
-    if (watcher) {
-      srcFilesDiff.deleted.forEach((path) => {
-        watcher.unwatch(path)
-      })
-
-      srcFilesDiff.added.forEach((path) => {
-        watcher.add(path)
-      })
-
-      return
-    }
-
-    // If there is no watcher for this function but the build produced files,
-    // we create a new watcher and watch them.
-    if (srcFilesDiff.added.size !== 0) {
-      const filesToWatch = [...srcFilesDiff.added, ...includedFiles]
-      const newWatcher = await watchDebounced(filesToWatch, {
-        onChange: () => {
-          this.buildFunctionAndWatchFiles(func, false)
-        },
-      })
-
-      this.functionWatchers.set(func.name, newWatcher)
+    // Lazy functions call this.onBuild themselves
+    if (!this.lazyLoadFunctions) {
+      await this.onBuild({ func, firstLoad, includedFiles, srcFilesDiff, error: buildError })
     }
   }
 
@@ -348,6 +296,12 @@ export class FunctionsRegistry {
 
     if (event === 'removed') {
       log(`${NETLIFYDEVLOG} ${chalk.magenta('Removed')} function ${chalk.yellow(func?.displayName)}`)
+
+      return
+    }
+
+    if (event === 'markedForBuild') {
+      log(`${NETLIFYDEVLOG} ${chalk.magenta('Marked')} function ${chalk.yellow(func?.displayName)} for build...`)
     }
   }
 
@@ -395,7 +349,12 @@ export class FunctionsRegistry {
 
     this.functions.set(name, func)
 
-    this.buildFunctionAndWatchFiles(func, !isReload)
+    if (this.lazyLoadFunctions) {
+      func.markForBuild({ cache: this.buildCache })
+      FunctionsRegistry.logEvent('markedForBuild', { func })
+    } else {
+      this.buildFunctionAndWatchFiles(func, !isReload)
+    }
   }
 
   /**
@@ -407,6 +366,79 @@ export class FunctionsRegistry {
   // eslint-disable-next-line class-methods-use-this
   async listFunctions(...args) {
     return await listFunctions(...args)
+  }
+
+  static onPrebuild({ firstLoad, func }) {
+    if (!firstLoad) {
+      FunctionsRegistry.logEvent('reloading', { func })
+    }
+  }
+
+  async onBuild({ error: buildError, firstLoad, func, includedFiles, srcFilesDiff }) {
+    const event = firstLoad ? 'loaded' : 'reloaded'
+
+    if (buildError) {
+      FunctionsRegistry.logEvent('buildError', { func })
+    } else {
+      const recommendedExtension = func.getRecommendedExtension()
+
+      if (recommendedExtension) {
+        const { filename } = func
+        const newFilename = filename ? `${basename(filename, extname(filename))}${recommendedExtension}` : null
+        const action = newFilename
+          ? `rename the function file to ${chalk.underline(
+              newFilename,
+            )}. Refer to https://ntl.fyi/functions-runtime for more information`
+          : `refer to https://ntl.fyi/functions-runtime`
+
+        const warning = `The function is using the legacy CommonJS format. To start using ES modules, ${action}.`
+
+        FunctionsRegistry.logEvent(event, { func, warnings: [warning] })
+      } else {
+        FunctionsRegistry.logEvent(event, { func })
+      }
+    }
+
+    if (func.isTypeScript()) {
+      this.checkTypesPackage()
+    }
+
+    // If the build hasn't resulted in any files being added or removed, there
+    // is nothing else we need to do.
+    if (!srcFilesDiff) {
+      return
+    }
+
+    const watcher = this.functionWatchers.get(func.name)
+
+    // If there is already a watcher for this function, we need to unwatch any
+    // files that have been removed and watch any files that have been added.
+    if (watcher) {
+      srcFilesDiff.deleted.forEach((path) => {
+        watcher.unwatch(path)
+      })
+
+      srcFilesDiff.added.forEach((path) => {
+        watcher.add(path)
+      })
+
+      return
+    }
+
+    // If there is no watcher for this function but the build produced files,
+    // we create a new watcher and watch them.
+    if (srcFilesDiff.added.size !== 0) {
+      const filesToWatch = [...srcFilesDiff.added, ...includedFiles]
+      const newWatcher = await watchDebounced(filesToWatch, {
+        onChange: () => {
+          this.buildFunctionAndWatchFiles(func, false)
+        },
+      })
+
+      this.functionWatchers.set(func.name, newWatcher)
+    }
+
+    return { includedFiles, srcFilesDiff }
   }
 
   /**
@@ -465,18 +497,33 @@ export class FunctionsRegistry {
           return
         }
 
-        const func = new NetlifyFunction({
-          config: this.config,
-          directory: directories.find((directory) => mainFile.startsWith(directory)),
-          mainFile,
-          name,
-          displayName,
-          projectRoot: this.projectRoot,
-          runtime,
-          timeoutBackground: this.timeouts.backgroundFunctions,
-          timeoutSynchronous: this.timeouts.syncFunctions,
-          settings: this.settings,
-        })
+        const func = this.lazyLoadFunctions
+          ? new LazyNetlifyFunction({
+              config: this.config,
+              directory: directories.find((directory) => mainFile.startsWith(directory)),
+              mainFile,
+              name,
+              displayName,
+              projectRoot: this.projectRoot,
+              runtime,
+              timeoutBackground: this.timeouts.backgroundFunctions,
+              timeoutSynchronous: this.timeouts.syncFunctions,
+              settings: this.settings,
+              onBuild: this.onBuild.bind(this),
+              onPrebuild: FunctionsRegistry.onPrebuild,
+            })
+          : new NetlifyFunction({
+              config: this.config,
+              directory: directories.find((directory) => mainFile.startsWith(directory)),
+              mainFile,
+              name,
+              displayName,
+              projectRoot: this.projectRoot,
+              runtime,
+              timeoutBackground: this.timeouts.backgroundFunctions,
+              timeoutSynchronous: this.timeouts.syncFunctions,
+              settings: this.settings,
+            })
 
         // If a function we're registering was also unregistered in this run,
         // then it was a rename. Let's flag it as such so that the messaging

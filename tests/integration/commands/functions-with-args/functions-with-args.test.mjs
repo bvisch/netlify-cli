@@ -287,6 +287,120 @@ describe.concurrent.each(testMatrix)('withSiteBuilder with args: $args', ({ args
     })
   })
 
+  test('In lazy mode, lazily adds a new JavaScript function when a function file is created', async (t) => {
+    await withSiteBuilder('js-function-create-function-file', async (builder) => {
+      const bundlerConfig = args.includes('esbuild') ? { node_bundler: 'esbuild' } : {}
+
+      await builder
+        .withNetlifyToml({
+          config: {
+            build: { publish: 'public' },
+            functions: { directory: 'functions' },
+            dev: { lazy: true },
+            ...bundlerConfig,
+          },
+        })
+        .buildAsync()
+
+      await withDevServer({ cwd: builder.directory, args }, async ({ outputBuffer, port, waitForLogMatching }) => {
+        await tryAndLogOutput(async () => {
+          const unauthenticatedResponse = await gotCatch404(`http://localhost:${port}/.netlify/functions/hello`)
+
+          t.expect(unauthenticatedResponse.statusCode).toBe(404)
+        }, outputBuffer)
+
+        await pause(WAIT_WRITE)
+
+        const functionLoaded = waitForLogMatching('Loaded function hello')
+
+        await builder
+          .withFunction({
+            path: 'hello.js',
+            handler: async () => ({
+              statusCode: 200,
+              body: 'Hello',
+            }),
+          })
+          .buildAsync()
+        await pause(WAIT_WRITE)
+
+        const response = await got(`http://localhost:${port}/.netlify/functions/hello`).text()
+        await functionLoaded
+
+        t.expect(response).toEqual('Hello')
+      })
+    })
+  })
+
+  test('In lazy mode, lazily adds a new TypeScript function when a function file is created', async (t) => {
+    await withSiteBuilder('ts-function-create-function-file', async (builder) => {
+      const bundlerConfig = args.includes('esbuild') ? { node_bundler: 'esbuild' } : {}
+
+      await builder
+        .withFunction({
+          path: 'functions/help.ts',
+          handler: async () => ({
+            statusCode: 200,
+            body: 'I need somebody. Not just anybody.',
+          }),
+          esm: true,
+        })
+        .withNetlifyToml({
+          config: {
+            build: { publish: 'public' },
+            functions: { directory: 'functions' },
+            dev: { lazy: true },
+            ...bundlerConfig,
+          },
+        })
+        .buildAsync()
+
+      await withDevServer({ cwd: builder.directory, args }, async ({ outputBuffer, port, waitForLogMatching }) => {
+        await tryAndLogOutput(async () => {
+          const unauthenticatedResponse = await gotCatch404(`http://localhost:${port}/.netlify/functions/hello`)
+
+          t.expect(unauthenticatedResponse.statusCode).toBe(404)
+        }, outputBuffer)
+
+        await pause(WAIT_WRITE)
+
+        const functionLoaded = waitForLogMatching('Loaded function hello')
+
+        await builder
+          .withContentFile({
+            path: 'functions/hello.ts',
+            content: `
+  interface Book {
+    title: string
+    author: string
+  }
+
+  const handler = async () => {
+    const book1: Book = {
+      title: 'Modern Web Development on the Jamstack',
+      author: 'Mathias Biilmann & Phil Hawksworth'
+    }
+
+    return {
+      statusCode: 200,
+      body: book1.title
+    }
+  }
+
+  export { handler }
+          `,
+          })
+          .buildAsync()
+        await pause(WAIT_WRITE)
+
+        const response = await got(`http://localhost:${port}/.netlify/functions/hello`).text()
+        await functionLoaded
+
+        t.expect(response).toEqual('Modern Web Development on the Jamstack')
+      })
+    })
+  })
+
   test('Adds a new JavaScript function when a function file is created', async (t) => {
     await withSiteBuilder('js-function-create-function-file', async (builder) => {
       const bundlerConfig = args.includes('esbuild') ? { node_bundler: 'esbuild' } : {}
